@@ -1,0 +1,6 @@
+.venv/
+simglucose/
+cspell.json
+pyproject.toml
+
+__pycache__/
