@@ -122,12 +122,12 @@ class SinglePPO(nn.Module):
 class RolloutBuffer:
     """Stores the trajectories collected by the agent."""
     def __init__(self, num_steps, state_dim, action_dim, device):
-        self.states = torch.zeros((num_steps, state_dim))
-        self.actions = torch.zeros((num_steps, action_dim))
-        self.log_probs = torch.zeros(num_steps)
-        self.rewards = torch.zeros(num_steps)
-        self.dones = torch.zeros(num_steps)
-        self.values = torch.zeros(num_steps)
+        self.states = torch.zeros((num_steps, state_dim)).to(device)
+        self.actions = torch.zeros((num_steps, action_dim)).to(device)
+        self.log_probs = torch.zeros(num_steps).to(device)
+        self.rewards = torch.zeros(num_steps).to(device)
+        self.dones = torch.zeros(num_steps).to(device)
+        self.values = torch.zeros(num_steps).to(device)
         self.num_steps = num_steps
         self.device = device
         self.ptr = 0
@@ -189,7 +189,7 @@ def train_model(env):
     ROLLOUT_STEPS = 2048   # Number of steps to collect per rollout
     MAX_TIMESTEPS = 100000 # Total timesteps to train
     ENTROPY_COEFF = 0.01
-    RUN_ON_CPU = True
+    RUN_ON_CPU = False
 
     # Set device
     device = torch.device(
@@ -203,18 +203,18 @@ def train_model(env):
     # simglucose action_space is Box(1,), so action_dim will be 1
     action_dim = env.action_space.shape[0]
 
-    action_low = torch.tensor(env.action_space.low) # lowest insulin does
-    action_high = torch.tensor(env.action_space.high) # highest insulin dose
+    action_low = torch.tensor(env.action_space.low).to(device) # lowest insulin does
+    action_high = torch.tensor(env.action_space.high).to(device) # highest insulin dose
 
     # Init model, optimizer, criterion, and rollout buffer
-    ppo_model = SinglePPO(env.action_space.low[0], env.action_space.high[0])
+    ppo_model = SinglePPO(env.action_space.low[0], env.action_space.high[0]).to(device)
     optimizer = optim.Adam(ppo_model.parameters(), lr=LEARNING_RATE)
     critic_loss_fn = nn.MSELoss()
     buffer = RolloutBuffer(ROLLOUT_STEPS, state_dim, action_dim, device)
 
     # Training Loop
     state, _ = env.reset() # returns (init_state, info)
-    state = torch.tensor(state, dtype=torch.float32)
+    state = torch.tensor(state, dtype=torch.float32).to(device)
 
     total_timesteps = 0
     episode_num = 0
@@ -234,11 +234,11 @@ def train_model(env):
                 action_dist, value_pred = ppo_model(state)
                 action = action_dist.sample()
                 log_prob = action_dist.log_prob(action).sum(dim=-1)
-
+	    
             action_clipped = torch.clamp(action, action_low, action_high)
 
             # Give action to environment (gym) to recieve reward and next state
-            next_state, reward, done, truncated, _ = env.step(action_clipped)
+            next_state, reward, done, truncated, _ = env.step(action_clipped.cpu())
 
             current_episode_reward += reward
 
@@ -262,7 +262,7 @@ def train_model(env):
                 episode_num += 1
                 current_episode_reward = 0
                 state, _ = env.reset() # <-- Changed
-                state = torch.tensor(state, dtype=torch.float32)
+                state = torch.tensor(state, dtype=torch.float32).to(device)
         # -- End of Rollout Phase --
 
         # Calculate Returns (discounted sum of rewards) and
