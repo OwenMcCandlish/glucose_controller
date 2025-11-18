@@ -187,8 +187,8 @@ def train_model(env):
     GAMMA = 0.99           # Discount factor
     GAE_LAMBDA = 0.95      # Lambda for Generalized Advantage Estimation
     PPO_EPSILON = 0.2      # Epsilon for clipping
-    PPO_EPOCHS = 10        # Number of optimization epochs per rollout
-    BATCH_SIZE = 64
+    PPO_EPOCHS = 5         # Number of optimization epochs per rollout
+    BATCH_SIZE = 256
     ROLLOUT_STEPS = 2048   # Number of steps to collect per rollout
     MAX_TIMESTEPS = 100000 # Total timesteps to train
     ENTROPY_COEFF = 0.01
