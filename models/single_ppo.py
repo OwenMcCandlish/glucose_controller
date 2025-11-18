@@ -10,10 +10,13 @@ import numpy as np
 from torch.distributions import Normal
 from gymnasium.wrappers import NormalizeObservation
 
+from torch.utils.tensorboard import SummaryWriter
+
 
 __all__ = ["reward_fun", "create_model"]
 MODEL_PATH = pathlib.Path("./trained/single_ppo.zip")
 STATS_PATH = pathlib.Path("./trained/stats/single_ppo_stats.pkl")
+LOG_PATH = pathlib.Path("./runs/single_ppo")
 
 
 # Public facing API
@@ -184,8 +187,8 @@ def train_model(env):
     GAMMA = 0.99           # Discount factor
     GAE_LAMBDA = 0.95      # Lambda for Generalized Advantage Estimation
     PPO_EPSILON = 0.2      # Epsilon for clipping
-    PPO_EPOCHS = 10        # Number of optimization epochs per rollout
-    BATCH_SIZE = 64
+    PPO_EPOCHS = 5         # Number of optimization epochs per rollout
+    BATCH_SIZE = 256
     ROLLOUT_STEPS = 2048   # Number of steps to collect per rollout
     MAX_TIMESTEPS = 100000 # Total timesteps to train
     ENTROPY_COEFF = 0.01
@@ -197,6 +200,9 @@ def train_model(env):
         else "cpu"
     )
     print(device)
+
+    # init writer for checking training progress
+    writer = SummaryWriter(log_dir=LOG_PATH)
 
     # simglucose observation_space is Box(1,), so state_dim will be 1
     state_dim = env.observation_space.shape[0]
@@ -234,7 +240,7 @@ def train_model(env):
                 action_dist, value_pred = ppo_model(state)
                 action = action_dist.sample()
                 log_prob = action_dist.log_prob(action).sum(dim=-1)
-	    
+
             action_clipped = torch.clamp(action, action_low, action_high)
 
             # Give action to environment (gym) to recieve reward and next state
@@ -258,6 +264,7 @@ def train_model(env):
 
             # Episode ends if done (goal reached or failed) OR truncated (time limit)
             if done or truncated: # <-- Changed
+                writer.add_scalar("Charts/Episode_Reward", current_episode_reward, total_timesteps)
                 print(f"Episode: {episode_num}, Timestep: {total_timesteps}, Reward: {current_episode_reward}")
                 episode_num += 1
                 current_episode_reward = 0
@@ -278,6 +285,9 @@ def train_model(env):
         # Adjustment Phase:
         #   The goal is to use the data collected in Rollout Phase to
         #   update the model's weights to make it better.
+        b_actor_losses = []
+        b_critic_losses = []
+        b_entropies = []
         ppo_model.train()
         for _ in range(PPO_EPOCHS):
             for states, actions, old_log_probs, old_values, returns, advantages in buffer.get_batch(BATCH_SIZE):
@@ -310,6 +320,14 @@ def train_model(env):
                 nn.utils.clip_grad_norm_(ppo_model.parameters(), 0.5)
                 optimizer.step()
 
+                b_actor_losses.append(actor_loss.item())
+                b_critic_losses.append(critic_loss.item())
+                b_entropies.append(entropy.item())
+
+        writer.add_scalar("Loss/Actor", np.mean(b_actor_losses), total_timesteps)
+        writer.add_scalar("Loss/Critic", np.mean(b_critic_losses), total_timesteps)
+        writer.add_scalar("Loss/Entropy", np.mean(b_entropies), total_timesteps)
+
         # Reset buffer pointer to empty buffer for next iteration
         buffer.ptr = 0
 
@@ -320,6 +338,7 @@ def train_model(env):
         pickle.dump(norm_stats, f)
 
     print("Training finished.")
+    writer.close()
     env.close()
     return ppo_model
 
