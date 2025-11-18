@@ -1,0 +1,5 @@
+https://huggingface.co/blog/deep-rl-ppo
+
+https://medium.com/intro-to-artificial-intelligence/proximal-policy-optimization-ppo-a-policy-based-reinforcement-learning-algorithm-3cf126a7562d
+
+https://www.datacamp.com/tutorial/proximal-policy-optimization

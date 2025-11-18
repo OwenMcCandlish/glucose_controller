@@ -1,0 +1,4 @@
+tot_reward: -40234.276977148715
+num_steps: 240
+steps_in_range: [138]
+percent_in_range: [0.575]

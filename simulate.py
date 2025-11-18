@@ -1,9 +1,13 @@
 import argparse
+from argparse import ArgumentParser
 import importlib
+import math
 
-# import gymnasium as gym
-import gym
-from gym.envs.registration import register
+import gymnasium as gym
+from gymnasium.envs.registration import register
+from gymnasium.wrappers import NormalizeObservation, NormalizeReward, TransformReward
+import torch
+import torch.nn as nn
 
 # TODO: add in argument for deciding patient
 
@@ -32,9 +36,7 @@ def default_reward_fun(BG_last_hour: list[int]) -> int:
     else:
         return 1
 
-
-def main():
-    # parse the command line for model type
+def init_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run Type 1 diabetes simulator with the specified model."
     )
@@ -43,6 +45,17 @@ def main():
         required=True,
         type=str
     )
+
+    _ = parser.add_argument(
+        "--train",
+        action="store_true"
+    )
+    return parser
+
+
+def main():
+    # parse the command line for model type
+    parser: argparse.ArgumentParser = init_arg_parser()
     args = parser.parse_args()
 
     # import the model
@@ -54,22 +67,29 @@ def main():
         print(f"No model found at 'models/{args.model}'")
         raise
 
-    # construct the model and get custom reward function if defined
-    model = model_module.create_model()
+    # Get custom reward function if one exists
     reward_fun = getattr(model_module, "reward_fun", default_reward_fun)
 
-
-    # setup simulation
+    # setup simulation environment
     register(
-        id='simglucose-adolescent2-v0',
-        entry_point='simglucose.envs:T1DSimEnv',
+        id='simglucose/adolescent2-v0',
+        entry_point='simglucose.envs:T1DSimGymnaisumEnv',
         kwargs={
             'patient_name': 'adolescent#002',
-            'reward_fun': reward_fun,
+            "reward_fun": reward_fun,
         }
     )
+    env = gym.make('simglucose/adolescent2-v0')
+    env = NormalizeReward(env, gamma=0.99)
+    env = NormalizeObservation(env)
 
-    env = gym.make('simglucose-adolescent2-v0')
+    # create the model
+    model = model_module.create_model(env=env, **vars(args))
+
+    # If pytorch model, set to eval mode
+    if isinstance(model, nn.Module):
+        model.eval()
+
 
     stats = Stats(
         tot_reward=0,
@@ -78,21 +98,30 @@ def main():
         percent_in_range=0
     )
 
-    observation, info = env.reset()
+    env.training = False
+    observation, info = env.reset(seed=999) # create random seeded environment for testing
+    observation = torch.tensor(observation).float()
     done = False
-    while not done:
-        env.render(mode='human')
-        action = model.predict(observation)
-        observation, reward, done, info = env.step(action)
+    truncated = False
+    while not done and not truncated:
+        env.render()
+        action = model.predict(observation)[0].item()
+        observation, reward, done, truncated, _ = env.step(action)
+        observation = torch.tensor(observation).float()
+
+        # Unnormalize observation for stats tracking
+        mean = env.obs_rms.mean[0]
+        var = env.obs_rms.var[0]
+        real_bg = (observation.item() * math.sqrt(var)) + mean
 
         # Update stats
         stats.tot_reward += reward
         stats.num_steps += 1
         stats.steps_in_range += (
-            BG_LOWER_BOUNDARY <= observation <= BG_UPPER_BOUNDARY
+            BG_LOWER_BOUNDARY <= real_bg <= BG_UPPER_BOUNDARY
         )
 
-    stats.percent_in_range = stat.steps_in_range / stats.num_steps
+    stats.percent_in_range = stats.steps_in_range / stats.num_steps
     stats.write_to_file(STATS_FILE_NAME)
     env.close()
     return
