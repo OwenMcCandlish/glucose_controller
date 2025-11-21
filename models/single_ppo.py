@@ -10,13 +10,16 @@ import numpy as np
 from torch.distributions import Normal
 from gymnasium.wrappers import NormalizeObservation
 
-from torch.utils.tensorboard import SummaryWriter
-
-
 __all__ = ["reward_fun", "create_model"]
 MODEL_PATH = pathlib.Path("./trained/single_ppo.zip")
 STATS_PATH = pathlib.Path("./trained/stats/single_ppo_stats.pkl")
 LOG_PATH = pathlib.Path("./runs/single_ppo")
+
+
+class NormStats:
+    def __init__(self, mean, var):
+        self.mean = mean
+        self.var = var
 
 
 # Public facing API
@@ -26,27 +29,39 @@ def reward_fun(BG_last_hour: list[int]) -> float:
     return -0.1 * (BG_last_hour[0] - 70) * (BG_last_hour[0] - 180)
 
 
-def create_model(env, **kwargs: dict[str, Any]):
+def create_model(make_env, **kwargs: dict[str, Any]):
     """
-    This function is called by the simulate.py script.
-    It loads and returns a pre-trained PPO agent.
+    This function is called by the simulate.py script and returns a trained model
     """
 
+    env = make_env()
     if MODEL_PATH.exists() and not kwargs.get("train"):
         # Load the trained agent
         print(f"Loading pre-trained model from: {MODEL_PATH}")
         model = SinglePPO(env.action_space.low[0], env.action_space.high[0])
         model.load_state_dict(torch.load(MODEL_PATH))
+        model.eval()
 
         # Load Normalization stats
-        with open(STATS_PATH, "rb") as f:
-            saved_stats = pickle.load(f)
-        env.obs_rms = saved_stats
+        # with open(STATS_PATH, "rb") as f:
+        #     saved_stats = pickle.load(f)
+        # model.trained = True
+        # model.mean = saved_stats.mean
+        # model.var = saved_stats.var
 
         return model
 
     print("Pre-Trained Agent Not Found. Training Model...")
-    model = train_model(env=env)
+    ppo_model = SinglePPO(env.action_space.low[0], env.action_space.high[0])
+    model = train_model(ppo_model, make_env=make_env)
+
+    torch.save(ppo_model.state_dict(), MODEL_PATH)
+
+    # norm_stats = NormStats(model.mean, model.var)
+    # with open(STATS_PATH, "wb") as f:
+    #     pickle.dump(norm_stats, f)
+
+    model.eval()
     return model
 
 
@@ -67,7 +82,13 @@ class CriticNetwork(nn.Module):
         return self.model(observation)
 
 class ActorNetwork(nn.Module):
-    def __init__(self, in_dims: int, hidden_dims: int =256) -> None:
+    def __init__(
+        self,
+        in_dims: int,
+        hidden_dims: int = 64,
+        min_insulin: int = 0,
+        max_insulin: int = 30,
+    ) -> None:
         super(ActorNetwork, self).__init__()
 
         # Predicts the mean
@@ -82,29 +103,45 @@ class ActorNetwork(nn.Module):
 
         # Learnable parameter for the standard deviation
         self.log_std = nn.Parameter(torch.zeros(1))
+        self.min_insulin = min_insulin
+        self.max_insulin = max_insulin
 
     def forward(self, observation):
         mean = self.model(observation)
 
         # Scale to the action space range [0, 30.0]
-        scaled_mean = (torch.tanh(mean) + 1) * 15.0
+        scaled_mean = (torch.tanh(mean) + 1) * (self.max_insulin / 2)
 
         std = torch.exp(self.log_std)
-        dist = Normal(mean, std)
+        dist = Normal(scaled_mean, std)
 
         return dist
 
 class SinglePPO(nn.Module):
-    def __init__(self, action_space_low, action_space_high):
+    def __init__(self, action_space_low=0, action_space_high=30):
         super().__init__()
-        self.actor = ActorNetwork(in_dims = 1)
+        self.actor = ActorNetwork(in_dims = 1, min_insulin=action_space_low, max_insulin=action_space_high)
         self.critic = CriticNetwork(in_dims = 1)
         self.action_space_low = action_space_low
         self.action_space_high = action_space_high
 
+        # self.trained = False # set to true after model_train is called
+        # self.mean = 0
+        # self.var = 1
+
+        self.register_buffer("trained", torch.zeros(1))
+        self.register_buffer("mean", torch.zeros(1))
+        self.register_buffer("var", torch.ones(1))
+
     def forward(self, state) -> tuple[Normal, float]:
-        # normalized_state = (state - 40.0) / (600.0 - 40.0)
-        normalized_state = state
+        if self.trained:
+            # print(f"non-normal: {state}")
+            normalized_state = (state - self.mean) / np.sqrt(self.var)
+            # print(f"normal: {normalized_state}")
+        else:
+            # Environment provides normalized state while training
+            normalized_state = state
+
         action_pred_dist = self.actor(normalized_state)
         value_pred = self.critic(normalized_state)
 
@@ -180,19 +217,22 @@ class RolloutBuffer:
             )
 
 # --- Main Training (Using gymnasium API) ---
-def train_model(env):
+def train_model(ppo_model, make_env):
     # --- Hyperparameters ---
     HIDDEN_DIM = 64
     LEARNING_RATE = 3e-4
     GAMMA = 0.99           # Discount factor
     GAE_LAMBDA = 0.95      # Lambda for Generalized Advantage Estimation
     PPO_EPSILON = 0.2      # Epsilon for clipping
-    PPO_EPOCHS = 5         # Number of optimization epochs per rollout
-    BATCH_SIZE = 256
-    ROLLOUT_STEPS = 2048   # Number of steps to collect per rollout
-    MAX_TIMESTEPS = 100000 # Total timesteps to train
+    PPO_EPOCHS = 10        # Number of optimization epochs per rollout
+    BATCH_SIZE = 64
+    VALUE_LOSS_COEFF = 0.5 # Weighting given to value loss in combined loss function
+    ROLLOUT_STEPS = 1024   # Number of steps to collect per rollout
+    MAX_TIMESTEPS = 1 # Total timesteps to train
     ENTROPY_COEFF = 0.01
     RUN_ON_CPU = False
+
+    normalized_env = NormalizeObservation(make_env()) # normalize observations only for training
 
     # Set device
     device = torch.device(
@@ -201,25 +241,24 @@ def train_model(env):
     )
     print(device)
 
-    # init writer for checking training progress
-    writer = SummaryWriter(log_dir=LOG_PATH)
+    ppo_model.train()
 
     # simglucose observation_space is Box(1,), so state_dim will be 1
-    state_dim = env.observation_space.shape[0]
+    state_dim = normalized_env.observation_space.shape[0]
     # simglucose action_space is Box(1,), so action_dim will be 1
-    action_dim = env.action_space.shape[0]
+    action_dim = normalized_env.action_space.shape[0]
 
-    action_low = torch.tensor(env.action_space.low).to(device) # lowest insulin does
-    action_high = torch.tensor(env.action_space.high).to(device) # highest insulin dose
+    action_low = torch.tensor(normalized_env.action_space.low).to(device) # lowest insulin does
+    action_high = torch.tensor(normalized_env.action_space.high).to(device) # highest insulin dose
 
     # Init model, optimizer, criterion, and rollout buffer
-    ppo_model = SinglePPO(env.action_space.low[0], env.action_space.high[0]).to(device)
+    ppo_model = ppo_model.to(device)
     optimizer = optim.Adam(ppo_model.parameters(), lr=LEARNING_RATE)
     critic_loss_fn = nn.MSELoss()
     buffer = RolloutBuffer(ROLLOUT_STEPS, state_dim, action_dim, device)
 
     # Training Loop
-    state, _ = env.reset() # returns (init_state, info)
+    state, _ = normalized_env.reset() # returns (init_state, info)
     state = torch.tensor(state, dtype=torch.float32).to(device)
 
     total_timesteps = 0
@@ -244,7 +283,7 @@ def train_model(env):
             action_clipped = torch.clamp(action, action_low, action_high)
 
             # Give action to environment (gym) to recieve reward and next state
-            next_state, reward, done, truncated, _ = env.step(action_clipped.cpu())
+            next_state, reward, done, truncated, _ = normalized_env.step(action_clipped.cpu())
 
             current_episode_reward += reward
 
@@ -264,11 +303,10 @@ def train_model(env):
 
             # Episode ends if done (goal reached or failed) OR truncated (time limit)
             if done or truncated: # <-- Changed
-                writer.add_scalar("Charts/Episode_Reward", current_episode_reward, total_timesteps)
-                print(f"Episode: {episode_num}, Timestep: {total_timesteps}, Reward: {current_episode_reward}")
+                # print(f"Episode: {episode_num}, Timestep: {total_timesteps}, Reward: {current_episode_reward}")
                 episode_num += 1
                 current_episode_reward = 0
-                state, _ = env.reset() # <-- Changed
+                state, _ = normalized_env.reset() # <-- Changed
                 state = torch.tensor(state, dtype=torch.float32).to(device)
         # -- End of Rollout Phase --
 
@@ -285,6 +323,7 @@ def train_model(env):
         # Adjustment Phase:
         #   The goal is to use the data collected in Rollout Phase to
         #   update the model's weights to make it better.
+        b_total_losses = []
         b_actor_losses = []
         b_critic_losses = []
         b_entropies = []
@@ -307,38 +346,40 @@ def train_model(env):
                 actor_loss = -torch.min(surr1, surr2).mean()
 
                 # Add entropy term
-                entropy = action_dist.entropy().mean()
-                actor_loss -= entropy * ENTROPY_COEFF
+                entropy = -action_dist.entropy().mean()
 
                 # Calculate Critic Loss
                 critic_loss = critic_loss_fn(critic_values.squeeze(), returns)
 
-                # Optimize Actor
+                # Total Loss = L_clip - coeff_1 * L_value + coeff_2 * L_entropy
+                # negate because minimizing not maximizing
+                total_loss = actor_loss + VALUE_LOSS_COEFF*critic_loss + ENTROPY_COEFF*entropy
+
+                # Optimize
                 optimizer.zero_grad()
-                actor_loss.backward()
-                critic_loss.backward()
-                nn.utils.clip_grad_norm_(ppo_model.parameters(), 0.5)
+                total_loss.backward()
                 optimizer.step()
 
+                b_total_losses.append(total_loss.item())
                 b_actor_losses.append(actor_loss.item())
                 b_critic_losses.append(critic_loss.item())
                 b_entropies.append(entropy.item())
 
-        writer.add_scalar("Loss/Actor", np.mean(b_actor_losses), total_timesteps)
-        writer.add_scalar("Loss/Critic", np.mean(b_critic_losses), total_timesteps)
-        writer.add_scalar("Loss/Entropy", np.mean(b_entropies), total_timesteps)
+        # print(f"[{total_timesteps:10d}]total_loss: {np.mean(b_total_losses)}")
+        # print(f"[{total_timesteps:10d}]actor_loss: {np.mean(b_actor_losses)}")
+        # print(f"[{total_timesteps:10d}]critic_loss: {np.mean(b_critic_losses)}")
+        # print(f"[{total_timesteps:10d}]entropy: {np.mean(b_entropies)}")
 
         # Reset buffer pointer to empty buffer for next iteration
         buffer.ptr = 0
 
-    torch.save(ppo_model.state_dict(), MODEL_PATH)
-
-    norm_stats = env.get_wrapper_attr("obs_rms")
-    with open(STATS_PATH, "wb") as f:
-        pickle.dump(norm_stats, f)
-
     print("Training finished.")
-    writer.close()
-    env.close()
+
+    # Set mean and var for normalization in testing
+    ppo_model.trained.copy_(torch.ones(1))
+    ppo_model.mean.copy_(torch.tensor(normalized_env.obs_rms.mean[0]))
+    ppo_model.var.copy_(torch.tensor(normalized_env.obs_rms.var[0]))
+
+    normalized_env.close()
     return ppo_model
 
