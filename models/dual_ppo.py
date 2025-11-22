@@ -130,7 +130,7 @@ def grid_search(
     for low_model, high_model in combinations(models, 2):
         for thresh in trans_threshes:
             dual_model = DualPPO(high_model, low_model, thresh)
-            print(f"Grid Search: {i}")
+            print(f"Grid Search: {i}, low: {low_model.action_space_high}, high: {high_model.action_space_high}, thresh: {thresh}")
             tir = validate_model(dual_model, env)
             if tir > best_tir:
                 best_tir = tir
