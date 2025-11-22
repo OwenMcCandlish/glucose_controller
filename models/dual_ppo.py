@@ -152,7 +152,6 @@ def validate_model(model: DualPPO, env: T1DSimEnv) -> float:
     done = False
     truncated = False
     while not done and not truncated:
-        env.render()
         action = model.predict(observation)[0].item()
         observation, _, done, truncated, _ = env.step(action)
         observation = torch.tensor(observation).float()
