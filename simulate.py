@@ -3,6 +3,7 @@ from argparse import ArgumentParser
 import importlib
 from datetime import datetime
 import math
+from pathlib import Path
 from functools import partial
 
 import gymnasium as gym
@@ -15,10 +16,14 @@ import torch.nn as nn
 from models import dual_ppo
 
 
-STATS_FILE_NAME = "stats.txt"
+STATS_FILE_DIR = Path("stats/")
 BG_UPPER_BOUNDARY = 180
 BG_LOWER_BOUNDARY = 70
+BG_SEVERE_UPPER_BOUNDARY = 250
+BG_SEVERE_LOWER_BOUNDARY = 50
 NUM_SCENARIOS = 100
+
+SIM_LENGTH = 2400 # 5 days
 
 DEFAULT_PATIENT = "adult"
 DEFAULT_PATIENT_NUM = "1"
@@ -87,7 +92,7 @@ def make_env(env_id, patient_name, reward_fun):
         register(
             id=env_id,
             entry_point='simglucose.envs:T1DSimGymnaisumEnv',
-            max_episode_steps=2400, # 5 days
+            max_episode_steps=SIM_LENGTH, # 5 days
             kwargs={
                 'patient_name': patient_name,
                 "reward_fun": reward_fun,
@@ -105,7 +110,8 @@ class Stats():
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-    def write_to_file(self, filename):
+    def write_to_file(self, filename: Path):
+        filename.parent.mkdir(parents=True, exist_ok=True)
         with open(filename, "w") as f:
             for stat_name, value in self.__dict__.items():
                 _ = f.write(f"{stat_name}: {value}\n")
@@ -190,14 +196,16 @@ def main():
         percent_in_range=0,
         percent_in_hypoglycemic=0,
         percent_in_hyperglycemic=0,
+        percent_in_severe_hypoglycemic=0,
+        percent_in_severe_hyperglycemic=0
     )
 
     env.training = False
-    observation, info = env.reset(seed=999) # create random seeded environment for testing
+    observation, info = env.reset() # create random seeded environment for testing
     observation = torch.tensor(observation).float()
     done = False
     truncated = False
-    while not done and not truncated:
+    for _ in range(SIM_LENGTH):
         env.render()
         action = model.predict(observation)[0].item()
         observation, reward, done, truncated, _ = env.step(action)
@@ -211,8 +219,18 @@ def main():
         stats.steps_in_range += (
             BG_LOWER_BOUNDARY <= real_bg <= BG_UPPER_BOUNDARY
         )
-        stats.percent_in_hypoglycemic += real_bg < BG_LOWER_BOUNDARY
-        stats.percent_in_hyperglycemic += real_bg > BG_UPPER_BOUNDARY
+        stats.percent_in_hypoglycemic += (
+            BG_SEVERE_LOWER_BOUNDARY <= real_bg < BG_LOWER_BOUNDARY
+        )
+        stats.percent_in_hyperglycemic += (
+            BG_SEVERE_UPPER_BOUNDARY >= real_bg > BG_UPPER_BOUNDARY
+        )
+        stats.percent_in_severe_hypoglycemic += real_bg < BG_SEVERE_LOWER_BOUNDARY
+        stats.percent_in_severe_hyperglycemic += real_bg > BG_SEVERE_UPPER_BOUNDARY
+
+        if (done or truncated):
+            observation, info = env.reset() # create random seeded environment for testing
+            observation = torch.tensor(observation).float()
 
 
     if (isinstance(model, dual_ppo.DualPPO)):
@@ -222,7 +240,9 @@ def main():
     stats.percent_in_range = stats.steps_in_range / stats.num_steps
     stats.percent_in_hypoglycemic = stats.percent_in_hypoglycemic / stats.num_steps
     stats.percent_in_hyperglycemic = stats.percent_in_hyperglycemic / stats.num_steps
-    stats.write_to_file(STATS_FILE_NAME)
+    stats.percent_in_severe_hypoglycemic /= stats.num_steps
+    stats.percent_in_severe_hyperglycemic /= stats.num_steps
+    stats.write_to_file(STATS_FILE_DIR / f"stats{args.patient_num}.txt")
     env.close()
     return
 

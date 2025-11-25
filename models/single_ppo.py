@@ -11,7 +11,7 @@ from torch.distributions import Normal
 from gymnasium.wrappers import NormalizeObservation
 
 __all__ = ["reward_fun", "create_model"]
-MODEL_PATH = pathlib.Path("./trained/single_ppo.zip")
+MODEL_DIR = pathlib.Path("./trained/single_ppo/")
 STATS_PATH = pathlib.Path("./trained/stats/single_ppo_stats.pkl")
 LOG_PATH = pathlib.Path("./runs/single_ppo")
 
@@ -33,12 +33,15 @@ def create_model(make_env, **kwargs: dict[str, Any]):
     """
     This function is called by the simulate.py script and returns a trained model
     """
+    MODEL_DIR.mkdir(exist_ok=True)
+    patient_name = f"{kwargs['patient_name']}#{kwargs['patient_num']:03}"
+    MODEL_PATH = MODEL_DIR / f"{patient_name}.zip"
 
     env = make_env()
     if MODEL_PATH.exists() and not kwargs.get("train"):
         # Load the trained agent
         print(f"Loading pre-trained model from: {MODEL_PATH}")
-        model = SinglePPO(env.action_space.low[0], env.action_space.high[0])
+        model = SinglePPO(env.action_space.low[0], env.action_space.high[0], single_mode=True)
         model.load_state_dict(torch.load(MODEL_PATH))
         model.eval()
 
@@ -52,7 +55,7 @@ def create_model(make_env, **kwargs: dict[str, Any]):
         return model
 
     print("Pre-Trained Agent Not Found. Training Model...")
-    ppo_model = SinglePPO(env.action_space.low[0], env.action_space.high[0])
+    ppo_model = SinglePPO(env.action_space.low[0], env.action_space.high[0], single_mode=True)
     model = train_model(ppo_model, make_env=make_env)
 
     torch.save(ppo_model.state_dict(), MODEL_PATH)
@@ -118,12 +121,13 @@ class ActorNetwork(nn.Module):
         return dist
 
 class SinglePPO(nn.Module):
-    def __init__(self, action_space_low=0, action_space_high=30):
+    def __init__(self, action_space_low=0, action_space_high=30, single_mode=False):
         super().__init__()
         self.actor = ActorNetwork(in_dims = 1, min_insulin=action_space_low, max_insulin=action_space_high)
         self.critic = CriticNetwork(in_dims = 1)
         self.action_space_low = action_space_low
         self.action_space_high = action_space_high
+        self.single_mode = single_mode
 
         # self.trained = False # set to true after model_train is called
         # self.mean = 0
@@ -155,6 +159,11 @@ class SinglePPO(nn.Module):
 
         # Make sure sampled action is within action space
         action_pred = torch.clamp(action_pred_dist.sample(), self.action_space_low, self.action_space_high)
+
+        if (hasattr(self, "single_mode")):
+            if (self.single_mode and self.trained and state <= 90):
+                action_pred = torch.zeros(1)
+
         return action_pred
 
 
@@ -302,7 +311,7 @@ def train_model(ppo_model, make_env):
             state = torch.tensor(next_state, dtype=torch.float32).to(device)
 
             # Episode ends if done (goal reached or failed) OR truncated (time limit)
-            if done or truncated: # <-- Changed
+            if done or truncated:
                 # print(f"Episode: {episode_num}, Timestep: {total_timesteps}, Reward: {current_episode_reward}")
                 episode_num += 1
                 current_episode_reward = 0
